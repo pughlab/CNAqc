@@ -40,6 +40,216 @@
 #' mutations_annotated <- annotate_variants(mutations)
 #' }
 #'
+#'
+annotate_variants_mut <- function(mutations,
+                                  reference = "hg38",
+                              drivers = CNAqc::intogen_drivers,
+                              make_0_span = FALSE,
+                              collapse = TRUE)
+{
+  # Old params, now fixed.
+  collapse = TRUE
+  
+  #inputs = annotate_variants_preprocess(x)
+  #mutations = inputs$mutations
+  #reference = inputs$reference
+  
+  if(reference == "GRCh38") reference = "hg38"
+  if(reference == "GRCh37") reference = "hg19"
+  
+  # Check for available packages
+  rqp = function(x) {
+    if (!require(x,  character.only = T, quietly = T) %>% suppressWarnings()) {
+      cli::cli_abort("Bioconducator package {.field {x}} is required to annotate variants")
+    }
+  }
+  
+  # Required packages
+  tx_pkg <-  paste0("TxDb.Hsapiens.UCSC.", reference, ".knownGene")
+  bs_pkg <- paste0("BSgenome.Hsapiens.UCSC.", reference)
+  
+  tx_pkg %>% rqp()
+  bs_pkg %>% rqp()
+  "Organism.dplyr" %>% rqp()
+  "org.Hs.eg.db" %>% rqp()
+  
+  # Get data and ranges
+  txdb <- eval(parse(text = tx_pkg))
+  if(make_0_span) mutations <- mutations %>% mutate(from = to - 1)
+  
+  rd <-
+    GenomicRanges::makeGRangesFromDataFrame(
+      mutations,
+      start.field = "from",
+      end.field = "to",
+      seqnames.field = "chr",
+      keep.extra.columns = F
+    )
+  
+  # VariantAnnotation package
+  cli::cli_process_start("Locating variants with {crayon::yellow('VariantAnnotation')}")
+  
+  loc <-
+    VariantAnnotation::locateVariants(rd, txdb, VariantAnnotation::AllVariants())
+  
+  cli::cli_process_done()
+  
+  # Src organism DB
+  cli::cli_process_start("Traslating Entrez ids")
+  
+  src <- src_organism(tx_pkg)
+  
+  translated_enttrz <-
+    AnnotationDbi::select(
+      src,
+      keys = loc$GENEID,
+      columns = c("symbol"),
+      keytype = "entrez"
+    )
+  
+  cli::cli_process_done()
+  
+  cli::cli_process_start("Transforming data")
+  
+  map <-
+    setNames(translated_enttrz$entrez, object =  translated_enttrz$symbol)
+  
+  loc$gene_symbol <- map[loc$GENEID]
+  
+  loc_df <- as.data.frame(loc, row.names = NULL) %>%
+    tibble::as_tibble() %>%
+    dplyr::mutate(
+      segment_id = paste(seqnames, start, end, sep = ":"),
+      chr = seqnames,
+      from = start,
+      to = end,
+      location = LOCATION
+    ) %>%
+    dplyr::select(chr, from, to, location, gene_symbol) %>%
+    dplyr::filter(gene_symbol != "NA") %>%
+    unique() %>%
+    dplyr::group_by(chr, from, to, gene_symbol) %>%
+    dplyr::summarize(location = paste(location, collapse = ":"),
+                     .groups = 'keep') %>%
+    dplyr::ungroup()
+  
+  mutationsut_coding <-
+    dplyr::left_join(loc_df %>%
+                       dplyr::filter(grepl(location, pattern = "coding")),
+                     mutations %>% mutate(from = as.integer(from), to = as.integer(to)),
+                     by = c("chr", "from", "to"))
+  
+  mutationsut_coding <-  dplyr::left_join(
+    mutationsut_coding,
+    seqlengths(Hsapiens) %>%
+      as.data.frame() %>%
+      tibble::rownames_to_column() %>%
+      dplyr::rename(chr = "rowname", length = "."),
+    by = "chr"
+  ) %>%
+    filter(from < length)
+  
+  mutationsut_coding_grange <-
+    GenomicRanges::makeGRangesFromDataFrame(
+      mutationsut_coding,
+      start.field = "from",
+      end.field = "to",
+      seqnames.field = "chr",
+      keep.extra.columns = F
+    )
+  
+  cli::cli_process_done()
+  
+  cli::cli_process_start("Predicting coding")
+  
+  coding <-
+    VariantAnnotation::predictCoding(mutationsut_coding_grange,
+                                     txdb,
+                                     seqSource = Hsapiens,
+                                     DNAStringSetList(lapply(mutationsut_coding$alt, function(i)
+                                       i)) %>% unlist)
+  
+  output_coding <- as.data.frame(coding) %>%
+    dplyr::mutate(
+      segment_id = paste(seqnames, start, end, sep = ":"),
+      chr = seqnames,
+      from = start,
+      to = end,
+      consequence = CONSEQUENCE,
+      refAA = REFAA,
+      varAA = VARAA
+    ) %>%
+    dplyr::select(chr, from, to, consequence, refAA, varAA) %>%
+    unique()
+  
+  cli::cli_h3("Coding substitutions found")
+  print(output_coding)
+  cat("\n")
+  
+  cli::cli_process_done()
+  
+  # Drivers annotation
+  cli::cli_process_start("Drivers annotation")
+  
+  if(!is.data.frame(drivers)) stop("`drivers` has to be a dataframe ")
+  
+  driver_genes = drivers$gene %>% unique
+  
+  res <-
+    dplyr::left_join(loc_df, output_coding,  by = c("chr", "from", "to")) %>%
+    dplyr::mutate(
+      driver_label = paste0(gene_symbol, "_", refAA, "->", varAA),
+      is_driver = gene_symbol %in% driver_genes
+    ) %>%
+    dplyr:: mutate(is_driver =
+                     ifelse(
+                       is.na(is_driver) |
+                         !grepl(location, pattern = "coding") |
+                         is.na(consequence) |
+                         grepl(consequence, pattern = "^(?!non)synonymous", perl = T),
+                       FALSE,
+                       gene_symbol %in% driver_genes # check against the list
+                     )
+    ) %>%
+    mutate(driver_label = ifelse(is_driver, driver_label, NA)) %>%
+    unique()
+  
+  cli::cli_h3("Found {.green {sum(res$is_driver)}} driver(s)")
+  
+  print(res %>% filter(is_driver))
+  
+  cli::cli_process_done()
+  
+  if(collapse){
+    res <- res %>%
+      group_by(chr,from,to) %>%
+      summarize(gene_symbol = paste(unique(gene_symbol), collapse = ":"),
+                location = paste(unique(location), collapse = ":"),
+                refAA = paste(unique(refAA), collapse = ":"),
+                varAA = paste(unique(varAA), collapse = ":"),
+                consequence = paste(unique(consequence), collapse = ":"),
+                driver_label= paste(unique(driver_label), collapse = ":"),
+                is_driver = any(is_driver)
+      ) %>%
+      ungroup()
+    
+    res$driver_label <- gsub(res$driver_label, pattern = "NA:", replacement = "", fixed = TRUE)
+  }
+  
+  # Re-assembly CNAqc obect
+  final_table = dplyr::left_join(
+    mutations,
+    res,
+    by = c("chr", "from", "to")
+  ) %>%
+    dplyr::arrange(-is_driver)
+  
+  if(make_0_span)  final_table <- final_table %>% dplyr::mutate(to = to + 1)
+  
+  return(final_table)
+}
+
+
 annotate_variants <- function(x,
                               drivers = CNAqc::intogen_drivers,
                               make_0_span = FALSE,

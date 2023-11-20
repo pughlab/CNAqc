@@ -113,6 +113,332 @@
 #'    delta_ploidy = 0.25,
 #'    verbose = TRUE)
 #' }
+
+## New function to use Sequenza extract file Rdata file instead of seqz file
+Sequenza_CNAqc_Ext = function(sample_id,
+                              seqzExt_file,
+                          maf_file = NULL,
+                          sex,
+                          cellularity = c(0.05, 1),
+                          ploidy = c(1.8, 5.4),
+                          reference = 'GRCh38',
+                          normalization.method = 'median',
+                          window = 1e5,
+                          gamma = 280,
+                          kmin = 300,
+                          min.reads.baf = 50,
+                          min.reads = 50,
+                          min.reads.normal = 15,
+                          max.mut.types = 1,
+                          delta_cellularity = 0.05,
+                          delta_ploidy = 0.25,
+                          verbose = FALSE,
+                          ...)
+{
+  
+    if(FALSE){
+   
+    SSM_maf_files <- list.files(paste0("/cluster/home/jbruce/git_repos/",
+                                       "MOHCCN-WGST-Post-Prossessing/Report//data/mafs/"),
+                                pattern = "SSM_maf.txt", full.names = T)
+    SSM_maf_file <- grep("MOHCCN_HCC",SSM_maf_files, value = T)
+    
+    HCC_maf <- read.table(SSM_maf_file, sep="\t", header = T, comment.char = "", quote = "")
+  
+    # maf_df <- subset(HCC_maf, Tumor_Sample_Barcode == "HCCMOH_0253_Lv_P_WG_HCC-B-253-T0-R-DNA")
+
+    sample_maf_df <- subset(HCC_maf, Tumor_Sample_Barcode == "HCCMOH_0253_Lv_P_WG_HCC-B-253-T0-R-DNA")
+
+    driver_maf <- subset(sample_maf_df, oncogenic_binary == "YES")
+
+    driver_IDS <- paste(driver_maf$Chromosome,
+                      driver_maf$Start_Position,
+                      driver_maf$End_Position,
+                      driver_maf$Tumor_Seq_Allele2)
+
+    full_maf.file = paste0("/cluster/projects/mohccn/data/HCCMOH/WGS/mutect2/PASS/",
+                       "mafs/HCCMOH_0253_Lv_P_WG_HCC-B-253-T0-R-DNA.mutect2.filtered.PASS.maf")
+
+    maf_df <- read.table(full_maf.file, sep="\t", header = T, comment.char = "", quote = "")
+
+    maf_df$oncogenic_binary <- "NO"
+
+    maf_df$oncogenic_binary[paste(maf_df$Chromosome,
+                      maf_df$Start_Position,
+                      maf_df$End_Position,
+                      maf_df$Tumor_Seq_Allele2) %in% driver_IDS] <- "YES"
+
+    seqzExt_file = "/cluster/projects/mohccn/data/HCCMOH//WGS/sequenza/HCCMOH_0253_Lv_P_WG_HCC-B-253-T0-R-DNA/gammas/500/HCCMOH_0253_Lv_P_WG_HCC-B-253-T0-R-DNA_sequenza_extract.RData"
+    
+    sample_id = unique(maf_df$Tumor_Sample_Barcode)
+    seqzExt_file = seqzExt_file
+    maf_df = maf_df
+    sex = "M"
+    cellularity = c(0.05, 1)
+    ploidy = c(1.8, 5.4)
+    reference = 'GRCh38'
+    normalization.method = 'median'
+    window = 1e5
+    gamma = 280
+    kmin = 300
+    min.reads.baf = 50
+    min.reads = 50
+    min.reads.normal = 15
+    max.mut.types = 1
+    delta_cellularity = 0.05
+    delta_ploidy = 0.25
+    verbose = FALSE
+    
+    
+  }
+
+  ## conver maf to compatible "mutations" format
+  ## convert maf df to compatible "mutations" format
+  
+  mutations <- data.frame(chr = maf_df$Chromosome,
+                          from = maf_df$Start_Position,
+                          to = maf_df$End_Position,
+                          ref = maf_df$Reference_Allele,
+                          alt = maf_df$Tumor_Seq_Allele2,
+                          FILTER = maf_df$FILTER,
+                          DP = maf_df$t_depth,
+                          NV = maf_df$t_alt_count,
+                          VAF = maf_df$t_alt_count/maf_df$t_depth,
+                          ANNOVAR_FUNCTION = maf_df$Variant_Classification,
+                          GENE = maf_df$Hugo_Symbol,
+                          is_driver = maf_df$oncogenic_binary == "YES",
+                          driver_label = paste(maf_df$Hugo_Symbol,maf_df$HGVSp_Short))
+  
+ mutations <- as.data.table(subset(mutations, FILTER == "PASS"))
+ #mutations <- subset(mutations, chr %in% paste0("chr",c(1:22, "X", "Y")))
+ #mutations <- subset(mutations, ! duplicated(paste(chr,from,to)))
+
+ #mutations <- annotate_variants_mut(mutations)
+  
+ # Auxiliary function: Sequenza check input parameters
+  Sequenza_check_inputs = function(sample_id,
+                                   seqzExt_file,
+                                   sex,
+                                   cellularity,
+                                   ploidy,
+                                   reference)
+  {
+    if (!is.character(sample_id))
+      cli::cli_abort("Unrecogniseable sample id, will not proceed.")
+    
+    cli::cli_alert("Sample id: {.field {sample_id}}")
+    
+    # if (!file.exists(seqzExt))
+    #   cli::cli_abort("File {.field {seqzExt}} does not exist, will not proceed.")
+    # 
+    # sz = format(object.size(seqzExt), units = "auto")
+    # cli::cli_alert("Sequenza seqz file: {.value \"{seqzExt}\"} [{.field {sz}}]")
+    
+    if (!(sex %in% c("M", "F")))
+      cli::cli_abort("Sex must be either female (F) or male (M).")
+    
+    sx = dplyr::case_when(sex == "F" ~ "Female (F)",
+                          sex == "M" ~ "Male (M)",)
+    cli::cli_alert("Sample sex: {.field {sx}}")
+    
+    if ((cellularity %>% length() != 2) |
+        !(cellularity[1] %>% is.numeric()) |
+        !(cellularity[2] %>% is.numeric()))
+      cli::cli_abort("Cellularity needs to be a numeric vector with two values.")
+    
+    cli::cli_alert(
+      "Testing cellularity (%) in [{.field {cellularity[1]}}, {.field {cellularity[2]}}]"
+    )
+    
+    if ((ploidy %>% length() != 2) |
+        !(ploidy[1] %>% is.numeric()) |
+        !(ploidy[2] %>% is.numeric()))
+      cli::cli_abort("Ploidy needs to be a numeric vector with two values.")
+    
+    cli::cli_alert("Testing ploidy (real-valued) in [{.field {ploidy[1]}}, {.field {ploidy[2]}}]")
+    
+    if (!(reference %>% is.character()) |
+        !(reference %in% c("GRCh38", "GRCh37", "hg19")))
+      cli::cli_abort("Reference must be any of GRCh38 or hg19/GRCh37.")
+    
+    cli::cli_alert("Reference genome: {.field {reference}}")
+  }
+  
+  
+  #### Check for Sequenza library ####
+  if (!require(sequenza)) {
+    cli::cli_abort("The R Sequenza package is not installed, will not proceed.")
+  }
+  
+  cli::cli_h1("Sequenza CNA calling wrapper with CNAqc")
+  
+  Sequenza_check_inputs(
+    sample_id = sample_id,
+    seqzExt_file = seqzExt_file,
+    sex = sex,
+    cellularity = cellularity,
+    ploidy = ploidy,
+    reference = reference
+  )
+  
+  #### If male use chrY, if female don't ####
+  is_female <-  sex == "F"
+  chromosomes <- paste0("chr",c(1:22, "X"))
+  # chromosomes = 1:22
+  
+  if (!as.logical(is_female)) {
+    chromosomes <- c(chromosomes, 'chrY')
+  }
+  
+  # cli::cli_h2("Extraction of required information [{crayon::blue('sequenza.extract')}]")
+  cat("\n")
+  cli::cli_process_start("Seqz pre-processing [{crayon::blue('sequenza.extract')}]")
+  cat("\n")
+  
+  # Load Sequenza Ext file
+  sez_name = load(seqzExt_file)
+  
+  assign("seqzExt", get(sez_name))
+  
+  ### OICR's seqzExt files have avg.depth but the script wants avg.depth.ratio
+  seqzExt <- c(seqzExt,list(avg.depth.ratio = seqzExt$avg.depth))
+  cli::cli_process_done()
+  
+  #### Parameters that will be logged as RDS ####
+  run_params = list(
+    sample_id = sample_id,
+    seqzExt = seqzExt,
+    sex = sex,
+    chromosome.list = chromosomes,
+    normalization.method = normalization.method,
+    window = window,
+    gamma = gamma,
+    kmin = kmin,
+    min.reads.baf = min.reads.baf,
+    min.reads = min.reads,
+    min.reads.normal = min.reads.normal,
+    max.mut.types = max.mut.types
+  )
+ 
+  run_index = 0
+  L_cache = L = NULL
+  
+  repeat {
+    
+    if(verbose)
+    {
+      cli::cli_alert("List of parameters to test")
+      print(L)
+    }
+    
+    run_index = run_index + 1
+    
+    # Handle a new run - special case for the first run
+    if (run_index > 1)
+    {
+      L_head = L %>% filter(row_number() == 1)
+      L = L %>% filter(row_number() > 1)
+      
+      # First run - parameters determined by the user
+      cellularity = L_head$cellularity + c(-delta_cellularity, delta_cellularity)
+      ploidy = L_head$ploidy + c(-delta_ploidy, delta_ploidy)
+    }
+    
+    # New run - parameters determined by the pipeline
+    L_cache_new = sequenza_fit_runner(seqzExt,
+                                      mutations,
+                                      run = run_index,
+                                      is_female,
+                                      cellularity,
+                                      ploidy,
+                                      sample_id,
+                                      out_dir = paste0("run_", run_index),
+                                      reference = reference)
+                                      #,
+                                      #...)
+    
+    L_cache = L_cache %>% bind_rows(L_cache_new)
+    
+    # Obtain proposals
+    new_proposals = get_proposals(sequenza = L_cache$sequenza[[nrow(L_cache)]],
+                                  cnaqc = L_cache$cnaqc[[nrow(L_cache)]])
+    
+    # Check them against the L_cache, create a list to go for
+    new_proposals = filter_proposals(
+      L_cache = L_cache,
+      new_proposals = new_proposals,
+      delta_c = delta_cellularity,
+      delta_p = delta_ploidy
+    )
+    
+    
+    if(verbose)
+    {
+      cli::cli_alert("New proposal")
+      print(new_proposals)
+      
+      cli::cli_alert("Cached evaluations")
+      print(L_cache)
+      
+    }
+    
+    L = L %>% bind_rows(new_proposals)
+    
+    if (L %>% nrow() == 0)
+      break
+  }
+  
+  if(!("QC" %in% names(L_cache))) cli::cli_abort("CNAqc cannot run on this sample. Aborting the pipeline.")
+  
+  # End of pipeline
+  best_run = L_cache %>% 
+    filter(QC=="PASS") %>% 
+    arrange(abs(score)) %>% 
+    slice(1) %>% 
+    pull(run)
+  
+  if((best_run %>% length()) == 0){
+    best_run = L_cache %>% 
+      arrange(abs(score)) %>% 
+      slice(1) %>% 
+      pull(run)
+  }
+  
+  best_fit = which(L_cache$run == best_run)
+  qc_status = L_cache$QC[best_fit]
+  
+  cli::cli_h2("Best fit with score {.field {L_cache$score[best_fit]}} and QC {.field {qc_status}}")
+  
+  if(qc_status == "FAIL")
+    cli::cli_alert_danger("")
+  else
+    cli::cli_alert_success("")
+  
+  R.utils::createLink(
+    link = 'final',
+    target = L_cache$run[best_fit],
+    skip = FALSE,
+    overwrite = TRUE
+  )
+  
+  # Plot all CNAqc results
+  pdf("./cnaqc_reports.pdf", onefile = TRUE, width = 18, height = 10)
+  lapply(L_cache$cnaqc %>% seq_along, function(x){
+    ggpubr::ggarrange(
+      plot_segments(L_cache$cnaqc[[x]], highlight = c('2:0', '2:1', '2:2', '1:1', '1:0'))+
+        ggtitle(paste("Run", x)),
+      plot_peaks_analysis(L_cache$cnaqc[[x]]),
+      ncol = 1) %>% print()
+  })
+  dev.off()
+  
+  # Save cumulative pipeline results
+  saveRDS(L_cache, file = "pipeline.rds")
+  
+  # Return summary table
+  return(L_cache)
+}
+
 Sequenza_CNAqc = function(sample_id,
                           seqz_file,
                           mutations = NULL,
@@ -376,6 +702,18 @@ sequenza_fit_runner = function(seqzExt,
                                reference,
                                ...)
 {
+
+  if(FALSE){
+    seqzExt = seqzExt
+    mutations = mutations
+    run = run_index
+    is_female = is_female
+    cellularity = cellularity
+    ploidy = ploidy
+    sample_id = sample_id
+    out_dir = paste0("run_", run_index)
+    reference = reference
+  }
   # Auxiliary function: Sequenza outputs parser
   parse_Sequenza_CNAs = function(out, x)
   {
